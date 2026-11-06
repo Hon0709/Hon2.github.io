@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python P2P Multiplayer</title>
+
+<script src="https://unpkg.com/peerjs@1.5.5/dist/peerjs.min.js"></script>
+<script src="https://cdn.jsdelivr.net/pyodide/v0.27.7/full/pyodide.js"></script>
+
+<style>
+body {
+    background: #17191f;
+    color: white;
+    font-family: sans-serif;
+    text-align: center;
+    padding: 30px;
+}
+
+button, input {
+    padding: 12px;
+    margin: 5px;
+    border-radius: 8px;
+    border: none;
+}
+
+button {
+    cursor: pointer;
+    background: #526dff;
+    color: white;
+}
+
+input {
+    background: #292d38;
+    color: white;
+}
+
+#score {
+    font-size: 50px;
+    margin: 25px;
+}
+
+#status {
+    color: #9da8ff;
+}
+</style>
+</head>
+
+<body>
+
+<h1>Python Multiplayer</h1>
+<p id="status">Python 엔진을 불러오는 중...</p>
+
+<hr>
+
+<h2>방 만들기</h2>
+<button onclick="createRoom()">방 생성</button>
+
+<p id="roomCode"></p>
+
+<hr>
+
+<h2>방 참가하기</h2>
+<input id="codeInput" placeholder="방 코드 입력">
+<button onclick="joinRoom()">참가</button>
+
+<hr>
+
+<h2>게임</h2>
+
+<div id="score">0</div>
+
+<p id="players">접속자: 0명</p>
+
+<button onclick="increaseScore()">점수 +1</button>
+
+<script>
+
+// -------------------------
+// 1. Python 엔진
+// -------------------------
+
+let pyodide;
+let gameState = { score: 0 };
+let peer;
+let connections = new Set();
+let hostConnection = null;
+let isHost = false;
+let connected = false;
+
+async function initPython() {
+
+    pyodide = await loadPyodide();
+
+    pyodide.runPython(`
+import json
+
+def apply_action(state_json, action_json):
+
+    state = json.loads(state_json)
+    action = json.loads(action_json)
+
+    if action["type"] == "increase":
+        state["score"] += 1
+
+    return json.dumps(state)
+    `);
+
+    document.getElementById("status").innerText =
+        "Python 엔진 준비 완료";
+
+}
+
+initPython();
+
+
+// -------------------------
+// 2. Python 게임 판정
+// -------------------------
+
+function runPythonAction(action) {
+
+    pyodide.globals.set(
+        "state_json",
+        JSON.stringify(gameState)
+    );
+
+    pyodide.globals.set(
+        "action_json",
+        JSON.stringify(action)
+    );
+
+    let result = pyodide.runPython(
+        "apply_action(state_json, action_json)"
+    );
+
+    gameState = JSON.parse(result);
+
+    render();
+
+}
+
+
+// -------------------------
+// 3. 화면 갱신
+// -------------------------
+
+function render() {
+
+    document.getElementById("score").innerText =
+        gameState.score;
+
+    document.getElementById("players").innerText =
+        "접속자: " +
+        (isHost ? connections.size + 1 : 1) +
+        "명";
+
+}
+
+
+// -------------------------
+// 4. 방장 데이터 전송
+// -------------------------
+
+function broadcast(data) {
+
+    connections.forEach(conn => {
+
+        if (conn.open) {
+            conn.send(data);
+        }
+
+    });
+
+}
+
+function broadcastState() {
+
+    broadcast({
+        type: "state",
+        state: gameState,
+        players: connections.size + 1
+    });
+
+}
+
+
+// -------------------------
+// 5. 방 생성
+// -------------------------
+
+function createRoom() {
+
+    if (!pyodide) {
+        alert("Python 엔진 준비 중");
+        return;
+    }
+
+    if (peer) return;
+
+    isHost = true;
+
+    const code = String(
+        Math.floor(100000 + Math.random() * 900000)
+    );
+
+    peer = new Peer("game-" + code);
+
+    peer.on("open", () => {
+
+        document.getElementById("roomCode").innerText =
+            "방 코드: " + code;
+
+        document.getElementById("status").innerText =
+            "방 생성 완료! 참가자를 기다리는 중";
+
+    });
+
+    peer.on("connection", conn => {
+
+        connections.add(conn);
+
+        conn.on("open", () => {
+            broadcastState();
+            render();
+        });
+
+        conn.on("data", data => {
+
+            if (data.type === "action") {
+
+                runPythonAction(data.action);
+                broadcastState();
+
+            }
+
+        });
+
+        conn.on("close", () => {
+
+            connections.delete(conn);
+            broadcastState();
+            render();
+
+        });
+
+    });
+
+    peer.on("error", err => {
+
+        document.getElementById("status").innerText =
+            "연결 오류: " + err.type;
+
+    });
+
+}
+
+
+// -------------------------
+// 6. 방 참가
+// -------------------------
+
+function joinRoom() {
+
+    if (!pyodide) {
+        alert("Python 엔진 준비 중");
+        return;
+    }
+
+    if (peer) return;
+
+    const code =
+        document.getElementById("codeInput").value.trim();
+
+    if (!/^\d{6}$/.test(code)) {
+        alert("6자리 방 코드를 입력해 주세요.");
+        return;
+    }
+
+    isHost = false;
+
+    peer = new Peer();
+
+    peer.on("open", () => {
+
+        hostConnection = peer.connect(
+            "game-" + code
+        );
+
+        hostConnection.on("open", () => {
+
+            connected = true;
+
+            document.getElementById("status").innerText =
+                "방에 연결되었습니다.";
+
+        });
+
+        hostConnection.on("data", data => {
+
+            if (data.type === "state") {
+
+                gameState = data.state;
+
+                document.getElementById("score").innerText =
+                    gameState.score;
+
+                document.getElementById("players").innerText =
+                    "접속자: " + data.players + "명";
+
+            }
+
+        });
+
+        hostConnection.on("close", () => {
+
+            connected = false;
+
+            document.getElementById("status").innerText =
+                "방 연결이 끊어졌습니다.";
+
+        });
+
+    });
+
+    peer.on("error", err => {
+
+        document.getElementById("status").innerText =
+            "접속 실패: " + err.type;
+
+    });
+
+}
+
+
+// -------------------------
+// 7. 게임 조작
+// -------------------------
+
+function increaseScore() {
+
+    if (!connected && !isHost) {
+        alert("먼저 방에 참가해 주세요.");
+        return;
+    }
+
+    const action = {
+        type: "increase"
+    };
+
+    if (isHost) {
+
+        runPythonAction(action);
+        broadcastState();
+
+    } else if (
+        hostConnection &&
+        hostConnection.open
+    ) {
+
+        hostConnection.send({
+            type: "action",
+            action: action
+        });
+
+    }
+
+}
+
+</script>
+
+</body>
+</html>
